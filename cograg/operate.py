@@ -1,7 +1,8 @@
+# 本模块包含 Cog-RAG 的图谱抽取与查询核心逻辑。
+# speed test 通过专用结构化日志读取真实 chunk 处理进度。
 """Core operations: text chunking, entity/theme extraction, hypergraph construction,
 and query modes (cog, cog-hybrid, cog-entity, cog-theme, naive)."""
 
-import sys
 import asyncio
 import json
 import re
@@ -11,6 +12,26 @@ from typing import Union, List, Dict, Any, Optional, Tuple
 from collections import Counter, defaultdict
 import warnings
 import time
+
+
+def _emit_monitor_progress(stage: str, status: str, current: int, total: int) -> None:
+    """向 DataWeaver 专用 logger 输出 Cog-RAG 的 chunk 进度。"""
+    logging.getLogger("dataweaver.progress").info(
+        "baseline progress",
+        extra={
+            "progress_event": {
+                "schema_version": 1,
+                "stage": stage,
+                "native_stage": stage,
+                "status": status,
+                "current": current,
+                "total": total,
+                "unit": "chunks",
+                "message": f"{stage} {current}/{total} chunks",
+            }
+        },
+    )
+
 
 from .utils import (
     logger,
@@ -596,6 +617,8 @@ async def extract_entities(
     global_config: dict,
 ) -> Optional[Tuple[BaseHypergraphStorage, BaseHypergraphStorage]]:
     """Extract entities and themes from text chunks, build dual-hypergraph.
+
+    通过结构化日志报告图谱抽取的真实 chunk 计数。
     
     This function processes text chunks to extract:
     - Entities and relationships for the entity-relation hypergraph
@@ -656,8 +679,10 @@ async def extract_entities(
     already_relations_high = 0
     already_theme = 0
     already_key = 0
-    
+    _emit_monitor_progress("graph_extract", "running", 0, len(ordered_chunks))
+
     async def _process_single_content(chunk_key_dp: Tuple[str, TextChunkSchema]):
+        """处理单个 chunk 并累计抽取进度。"""
         nonlocal already_processed, already_entities, already_relations, already_relations_low, already_relations_high, already_theme, already_key
 
         chunk_key = chunk_key_dp[0]
@@ -785,25 +810,8 @@ async def extract_entities(
         already_relations_high += len(maybe_edges_high)
         already_theme += len(maybe_theme)
         already_key += len(maybe_key)
-        now_ticks = PROMPTS["process_tickers"][
-            already_processed % len(PROMPTS["process_tickers"])
-        ]
-
-        # 计算用时
-        current_time = datetime.now()
-        time = current_time - begin_time
-        total_seconds = int(time.total_seconds())
-        hours = total_seconds // 3600
-        minutes = (total_seconds % 3600) // 60
-        seconds = total_seconds % 60
-        # 进度条
-        percent = (already_processed / len(ordered_chunks)) * 100
-        bar_length = int(50 * already_processed // len(ordered_chunks))
-        bar = '█' * bar_length + '-' * (50 - bar_length)
-        sys.stdout.write(
-            f'\n\r|{bar}| {percent:.2f}% |{hours:02}:{minutes:02}:{seconds:02}| {now_ticks} Processed {already_theme} themes, {already_key} keys, {already_entities} entities, {already_relations} relations, {already_relations_low} relations_low, {already_relations_high} relations_high \n')
-        sys.stdout.flush()
-        return dict(maybe_nodes), dict(maybe_edges), dict(maybe_edges_low), dict(maybe_edges_high), dict(maybe_theme) , dict(maybe_key)
+        _emit_monitor_progress("graph_extract", "running", already_processed, len(ordered_chunks))
+        return dict(maybe_nodes), dict(maybe_edges), dict(maybe_edges_low), dict(maybe_edges_high), dict(maybe_theme), dict(maybe_key)
 
     # ----------------------------------------------------------------------------
     # use_llm_func is wrapped in asyncio.Semaphore for concurrency control
@@ -812,6 +820,7 @@ async def extract_entities(
     results = await asyncio.gather(
         *[_process_single_content(c) for c in ordered_chunks ]
     )
+    _emit_monitor_progress("graph_extract", "completed", len(ordered_chunks), len(ordered_chunks))
     maybe_nodes = defaultdict(list)
     maybe_edges = defaultdict(list)
     high = defaultdict(list)
